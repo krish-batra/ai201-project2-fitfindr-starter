@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,8 +70,40 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the search description into lowercase keywords.
+    keywords = [word for word in re.findall(r"[a-z0-9]+", description.lower())]
+
+    size_filter = size.lower() if size else None
+
+    scored: list[tuple[int, dict]] = []
+    for listing in listings:
+        # Filter by max_price (inclusive), skipping if not provided.
+        if max_price is not None and listing["price"] > max_price:
+            continue
+
+        # Filter by size (case-insensitive substring match), skipping if None.
+        if size_filter is not None and size_filter not in listing["size"].lower():
+            continue
+
+        # Score by keyword overlap against title, description, and style_tags.
+        haystack = " ".join(
+            [
+                listing["title"],
+                listing["description"],
+                " ".join(listing["style_tags"]),
+            ]
+        ).lower()
+        score = sum(1 for kw in keywords if kw in haystack)
+
+        # Drop listings with no keyword overlap.
+        if score > 0:
+            scored.append((score, listing))
+
+    # Sort by score, highest first.
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [listing for _, listing in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +133,73 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Describe the new item for the prompt.
+    item_summary = (
+        f"- Title: {new_item.get('title', 'Unknown item')}\n"
+        f"- Category: {new_item.get('category', 'unknown')}\n"
+        f"- Colors: {', '.join(new_item.get('colors', [])) or 'unspecified'}\n"
+        f"- Style tags: {', '.join(new_item.get('style_tags', [])) or 'unspecified'}\n"
+        f"- Description: {new_item.get('description', '')}"
+    )
+
+    items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+
+    if not items:
+        # No wardrobe to work with — ask for general styling advice.
+        prompt = (
+            "You are a thoughtful personal stylist. A shopper is considering "
+            "this secondhand item:\n\n"
+            f"{item_summary}\n\n"
+            "They have not shared their existing wardrobe. Give general styling "
+            "advice for this piece: what kinds of items pair well with it, what "
+            "vibe or occasions it suits, and 2-3 concrete outfit ideas using "
+            "common wardrobe staples. Keep it friendly and practical."
+        )
+    else:
+        # Format the wardrobe so the LLM can name specific pieces.
+        wardrobe_lines = []
+        for item in items:
+            colors = ", ".join(item.get("colors", []))
+            tags = ", ".join(item.get("style_tags", []))
+            notes = item.get("notes")
+            line = f"- {item.get('name', 'Unnamed item')} ({item.get('category', 'unknown')})"
+            details = []
+            if colors:
+                details.append(f"colors: {colors}")
+            if tags:
+                details.append(f"style: {tags}")
+            if notes:
+                details.append(f"notes: {notes}")
+            if details:
+                line += " — " + "; ".join(details)
+            wardrobe_lines.append(line)
+        wardrobe_text = "\n".join(wardrobe_lines)
+
+        prompt = (
+            "You are a thoughtful personal stylist. A shopper is considering "
+            "this secondhand item:\n\n"
+            f"{item_summary}\n\n"
+            "Here is their existing wardrobe:\n\n"
+            f"{wardrobe_text}\n\n"
+            "Suggest 1-2 specific, complete outfit combinations that pair the "
+            "new item with pieces from their wardrobe. Name the actual wardrobe "
+            "pieces you are using by name. Explain briefly why each outfit works. "
+            "Keep it friendly and practical."
+        )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        suggestion = response.choices[0].message.content
+        if suggestion and suggestion.strip():
+            return suggestion.strip()
+        return "Sorry, I couldn't generate an outfit suggestion right now. Please try again."
+    except Exception as exc:
+        return f"Sorry, I couldn't generate an outfit suggestion due to an error: {exc}"
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +231,40 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # Guard against an empty or whitespace-only outfit — do not call the LLM.
+    if not outfit or not outfit.strip():
+        return (
+            "Can't create a fit card: no outfit suggestion was provided. "
+            "Generate an outfit with suggest_outfit() first."
+        )
+
+    title = new_item.get("title", "this thrifted find")
+    price = new_item.get("price")
+    price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    prompt = (
+        "You write short, fun captions for outfit-of-the-day (OOTD) posts on "
+        "Instagram and TikTok. Write a casual, authentic caption (2-4 sentences) "
+        "for a thrifted find, based on this outfit:\n\n"
+        f"{outfit}\n\n"
+        f"The featured piece is the \"{title}\", which costs {price_str} on "
+        f"{platform}. Naturally work the item name, its price, and the platform "
+        "into the caption exactly once each. Capture the vibe of the outfit in "
+        "specific terms. It should read like a real person posting their fit, "
+        "NOT like a product description. No hashtag dump — keep it natural."
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.9,
+        )
+        caption = response.choices[0].message.content
+        if caption and caption.strip():
+            return caption.strip()
+        return "Sorry, I couldn't create a fit card right now. Please try again."
+    except Exception as exc:
+        return f"Sorry, I couldn't create a fit card due to an error: {exc}"
